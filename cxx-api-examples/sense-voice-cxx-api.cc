@@ -23,7 +23,7 @@ int32_t main() {
   OfflineRecognizerConfig config;
 
   config.model_config.sense_voice.model =
-      "./sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx";
+      "./sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.onnx";
   config.model_config.sense_voice.use_itn = true;
   config.model_config.sense_voice.language = "auto";
   config.model_config.tokens =
@@ -40,7 +40,7 @@ int32_t main() {
   std::cout << "Loading model done\n";
 
   std::string wave_filename =
-      "./sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/test_wavs/en.wav";
+      "./audios/girl-zh.wav";
 
   Wave wave = ReadWave(wave_filename);
   if (wave.samples.empty()) {
