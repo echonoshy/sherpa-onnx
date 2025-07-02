@@ -10,6 +10,8 @@
 #include <unordered_map>
 #include <string>
 #include <cstring>  // for strcpy
+#include <thread>   // 添加线程支持
+#include <atomic>   // 添加原子操作支持
 
 #include "sherpa-onnx/c-api/cxx-api.h"
 
@@ -54,12 +56,35 @@ private:
     // 添加默认会话ID用于向后兼容
     std::string default_session_id_;
 
+    // 添加自动清理相关成员
+    std::atomic<bool> auto_cleanup_enabled_;
+    std::atomic<int> session_timeout_seconds_;
+    std::unique_ptr<std::thread> cleanup_thread_;
+    std::atomic<bool> stop_cleanup_thread_;
+    
+    // 自动清理线程函数
+    void AutoCleanupThread() {
+        while (!stop_cleanup_thread_.load()) {
+            // 每30秒检查一次过期会话
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            
+            if (auto_cleanup_enabled_.load()) {
+                CleanupExpiredSessions(session_timeout_seconds_.load());
+            }
+        }
+    }
+
 public:
     SenseVoiceStreamingWrapper() 
         : expected_sample_rate_(16000), window_size_(512), initialized_(false),
-          debug_mode_(false), intermediate_decode_interval_(0.2) {}
+          debug_mode_(false), intermediate_decode_interval_(0.2),
+          auto_cleanup_enabled_(false), session_timeout_seconds_(300),
+          stop_cleanup_thread_(false) {}
     
-    ~SenseVoiceStreamingWrapper() = default;
+    ~SenseVoiceStreamingWrapper() {
+        // 停止自动清理线程
+        StopAutoCleanup();
+    }
 
     bool InitModel(const char* vad_model_path, const char* sense_voice_model_path, 
                    const char* tokens_path,
@@ -176,6 +201,9 @@ public:
         
         // 现在可以安全地使用session，即使它从map中被删除
         std::lock_guard<std::mutex> session_lock(session->session_mutex);
+        
+        // 更新最后活动时间
+        session->last_activity = std::chrono::steady_clock::now();
         
         // Convert bytes to float samples (assuming 16-bit PCM)
         const int16_t* samples_int16 = reinterpret_cast<const int16_t*>(audio_data);
@@ -375,6 +403,65 @@ public:
             default_session_id_.clear();
         }
     }
+
+    // 启动自动清理
+    void StartAutoCleanup(int timeout_seconds = 300, int check_interval_seconds = 30) {
+        if (cleanup_thread_ && cleanup_thread_->joinable()) {
+            return; // 已经启动
+        }
+        
+        session_timeout_seconds_.store(timeout_seconds);
+        auto_cleanup_enabled_.store(true);
+        stop_cleanup_thread_.store(false);
+        
+        cleanup_thread_ = std::make_unique<std::thread>([this, check_interval_seconds]() {
+            while (!stop_cleanup_thread_.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(check_interval_seconds));
+                
+                if (auto_cleanup_enabled_.load()) {
+                    CleanupExpiredSessions(session_timeout_seconds_.load());
+                }
+            }
+        });
+        
+        if (debug_mode_) {
+            std::cout << "[DEBUG] Auto cleanup started with timeout: " << timeout_seconds 
+                      << "s, check interval: " << check_interval_seconds << "s" << std::endl;
+        }
+    }
+    
+    // 停止自动清理
+    void StopAutoCleanup() {
+        auto_cleanup_enabled_.store(false);
+        stop_cleanup_thread_.store(true);
+        
+        if (cleanup_thread_ && cleanup_thread_->joinable()) {
+            cleanup_thread_->join();
+            cleanup_thread_.reset();
+        }
+        
+        if (debug_mode_) {
+            std::cout << "[DEBUG] Auto cleanup stopped" << std::endl;
+        }
+    }
+    
+    // 设置会话超时时间
+    void SetSessionTimeout(int timeout_seconds) {
+        session_timeout_seconds_.store(timeout_seconds);
+        if (debug_mode_) {
+            std::cout << "[DEBUG] Session timeout set to: " << timeout_seconds << "s" << std::endl;
+        }
+    }
+    
+    // 获取当前超时设置
+    int GetSessionTimeout() const {
+        return session_timeout_seconds_.load();
+    }
+    
+    // 检查自动清理是否启用
+    bool IsAutoCleanupEnabled() const {
+        return auto_cleanup_enabled_.load();
+    }
 };
 
 // C接口
@@ -475,5 +562,28 @@ extern "C" {
     
     EXPORT void cleanup_expired_sessions(SenseVoiceStreamingWrapper* wrapper, int timeout_seconds) {
         wrapper->CleanupExpiredSessions(timeout_seconds);
+    }
+    
+    EXPORT void start_auto_cleanup(SenseVoiceStreamingWrapper* wrapper, 
+                                  int timeout_seconds, 
+                                  int check_interval_seconds) {
+        wrapper->StartAutoCleanup(timeout_seconds, check_interval_seconds);
+    }
+    
+    EXPORT void stop_auto_cleanup(SenseVoiceStreamingWrapper* wrapper) {
+        wrapper->StopAutoCleanup();
+    }
+    
+    EXPORT void set_session_timeout(SenseVoiceStreamingWrapper* wrapper, 
+                                   int timeout_seconds) {
+        wrapper->SetSessionTimeout(timeout_seconds);
+    }
+    
+    EXPORT int get_session_timeout(SenseVoiceStreamingWrapper* wrapper) {
+        return wrapper->GetSessionTimeout();
+    }
+    
+    EXPORT int is_auto_cleanup_enabled(SenseVoiceStreamingWrapper* wrapper) {
+        return wrapper->IsAutoCleanupEnabled() ? 1 : 0;
     }
 } 

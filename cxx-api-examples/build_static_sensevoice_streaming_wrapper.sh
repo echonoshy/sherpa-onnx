@@ -19,8 +19,10 @@ cmake -DCMAKE_BUILD_TYPE=Release \
       -DSHERPA_ONNX_ENABLE_TESTS=OFF \
       -DSHERPA_ONNX_ENABLE_CHECK=OFF \
       -DCMAKE_FIND_LIBRARY_SUFFIXES=".a;.so" \
-      -DCMAKE_CXX_FLAGS="-fPIC" \
-      -DCMAKE_C_FLAGS="-fPIC" \
+      -DCMAKE_CXX_FLAGS="-fPIC -pthread" \
+      -DCMAKE_C_FLAGS="-fPIC -pthread" \
+      -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -pthread" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-static-libgcc -static-libstdc++ -pthread" \
       ..
 
 echo "Building sherpa-onnx libraries..."
@@ -42,4 +44,4 @@ else
 fi
 
 echo "Running dependency check..."
-python3 /root/sherpa-onnx/cxx-api-examples/check_dependencies.py
+python /root/sherpa-onnx/cxx-api-examples/check_dependencies.py

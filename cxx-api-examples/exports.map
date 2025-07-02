@@ -13,6 +13,11 @@
     flush_remaining;
     reset_wrapper;
     cleanup_expired_sessions;
+    start_auto_cleanup;
+    stop_auto_cleanup;
+    set_session_timeout;
+    get_session_timeout;
+    is_auto_cleanup_enabled;
   local:
     *;
 };

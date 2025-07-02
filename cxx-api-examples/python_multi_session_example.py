@@ -71,6 +71,15 @@ class SenseVoiceMultiSession:
             
             self.lib.cleanup_expired_sessions.argtypes = [c_void_p, c_int]
             
+            # Add auto cleanup function signatures
+            self.lib.start_auto_cleanup.argtypes = [c_void_p, c_int, c_int]
+            self.lib.stop_auto_cleanup.argtypes = [c_void_p]
+            self.lib.set_session_timeout.argtypes = [c_void_p, c_int]
+            self.lib.get_session_timeout.argtypes = [c_void_p]
+            self.lib.get_session_timeout.restype = c_int
+            self.lib.is_auto_cleanup_enabled.argtypes = [c_void_p]
+            self.lib.is_auto_cleanup_enabled.restype = c_int
+            
             # Create wrapper instance
             self.wrapper = self.lib.create_wrapper()
             
@@ -176,8 +185,40 @@ class SenseVoiceMultiSession:
         """Clean up expired sessions"""
         self.lib.cleanup_expired_sessions(self.wrapper, timeout_seconds)
     
+    def start_auto_cleanup(self, timeout_seconds=300, check_interval_seconds=30):
+        """Start automatic cleanup of expired sessions"""
+        self.lib.start_auto_cleanup(self.wrapper, timeout_seconds, check_interval_seconds)
+        if hasattr(self, '_auto_cleanup_started'):
+            return
+        self._auto_cleanup_started = True
+        print(f"🔧 Auto cleanup started (timeout: {timeout_seconds}s, check interval: {check_interval_seconds}s)")
+    
+    def stop_auto_cleanup(self):
+        """Stop automatic cleanup"""
+        self.lib.stop_auto_cleanup(self.wrapper)
+        if hasattr(self, '_auto_cleanup_started'):
+            print("🔧 Auto cleanup stopped")
+            delattr(self, '_auto_cleanup_started')
+    
+    def set_session_timeout(self, timeout_seconds):
+        """Set session timeout in seconds"""
+        self.lib.set_session_timeout(self.wrapper, timeout_seconds)
+        print(f"🔧 Session timeout set to {timeout_seconds}s")
+    
+    def get_session_timeout(self):
+        """Get current session timeout setting"""
+        return self.lib.get_session_timeout(self.wrapper)
+    
+    def is_auto_cleanup_enabled(self):
+        """Check if auto cleanup is enabled"""
+        return self.lib.is_auto_cleanup_enabled(self.wrapper) != 0
+    
     def cleanup(self):
         """Actively clean up all resources"""
+        # Stop auto cleanup first
+        if hasattr(self, '_auto_cleanup_started'):
+            self.stop_auto_cleanup()
+        
         if hasattr(self, 'wrapper') and self.wrapper:
             self.lib.destroy_wrapper(self.wrapper)
             self.wrapper = None
@@ -277,6 +318,10 @@ def test_concurrent_sessions(recognizer, num_clients=3, audio_path="/root/sherpa
     """Test concurrent sessions with simplified approach"""
     print(f"\n=== Testing {num_clients} Concurrent Clients ===")
     
+    # Start auto cleanup before creating sessions
+    recognizer.start_auto_cleanup(timeout_seconds=180, check_interval_seconds=20)
+    print(f"🔧 Auto cleanup enabled with 180s timeout")
+    
     # Create sessions
     sessions = []
     for i in range(num_clients):
@@ -327,6 +372,10 @@ def test_concurrent_sessions(recognizer, num_clients=3, audio_path="/root/sherpa
             print(f"✗ Error cleaning up session for {client_name}: {e}")
     
     print(f"Final active sessions: {recognizer.get_active_session_count()}")
+    
+    # Show auto cleanup status
+    print(f"🔧 Auto cleanup enabled: {recognizer.is_auto_cleanup_enabled()}")
+    print(f"🔧 Session timeout: {recognizer.get_session_timeout()}s")
 
 
 def run_basic_test():
@@ -348,6 +397,9 @@ def run_basic_test():
         
         print("✅ Model initialized successfully")
         
+        # Enable auto cleanup for the entire test
+        recognizer.start_auto_cleanup(timeout_seconds=120, check_interval_seconds=15)
+        
         # Test with 2 and 3 clients
         for num_clients in [2, 3]:
             print(f"\n{'='*60}")
@@ -363,6 +415,8 @@ def run_basic_test():
             if num_clients < 3:
                 print("\nWaiting 2 seconds before next test...")
                 time.sleep(2)
+        
+        # Auto cleanup will be stopped automatically when exiting the 'with' block
 
 
 def run_stress_test():
@@ -383,6 +437,10 @@ def run_stress_test():
         
         print("=== Stress Test: 10 Concurrent Clients ===")
         
+        # Enable aggressive auto cleanup for stress test
+        recognizer.start_auto_cleanup(timeout_seconds=60, check_interval_seconds=10)
+        print("🔧 Aggressive auto cleanup enabled for stress test (60s timeout, 10s interval)")
+        
         start_time = time.time()
         test_concurrent_sessions(
             recognizer,
@@ -392,6 +450,7 @@ def run_stress_test():
         total_time = time.time() - start_time
         
         print(f"\nStress test completed in {total_time:.2f} seconds")
+        print(f"🔧 Final session count: {recognizer.get_active_session_count()}")
 
 
 def run_concurrent_test(num_clients):
@@ -413,9 +472,20 @@ def run_concurrent_test(num_clients):
         
         print("✅ Model initialized successfully")
         
+        # Configure auto cleanup based on number of clients
+        if num_clients <= 5:
+            timeout_seconds = 180
+            check_interval = 20
+        else:
+            timeout_seconds = 120
+            check_interval = 15
+        
+        recognizer.start_auto_cleanup(timeout_seconds=timeout_seconds, check_interval_seconds=check_interval)
+        
         # Run test with specified number of clients
         print(f"\n{'='*60}")
         print(f"Running Test: {num_clients} Concurrent Clients")
+        print(f"Auto Cleanup: {timeout_seconds}s timeout, {check_interval}s check interval")
         print(f"{'='*60}")
         
         start_time = time.time()
@@ -427,6 +497,8 @@ def run_concurrent_test(num_clients):
         total_time = time.time() - start_time
         
         print(f"\nTest completed in {total_time:.2f} seconds")
+        print(f"🔧 Auto cleanup status: {'Enabled' if recognizer.is_auto_cleanup_enabled() else 'Disabled'}")
+        print(f"🔧 Final active sessions: {recognizer.get_active_session_count()}")
 
 
 if __name__ == "__main__":

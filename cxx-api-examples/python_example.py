@@ -52,6 +52,15 @@ class SenseVoiceStreaming:
         self.lib.reset_wrapper.argtypes = [c_void_p]
         self.lib.set_debug_mode.argtypes = [c_void_p, c_int]
         
+        # Add auto cleanup function signatures
+        self.lib.start_auto_cleanup.argtypes = [c_void_p, c_int, c_int]
+        self.lib.stop_auto_cleanup.argtypes = [c_void_p]
+        self.lib.set_session_timeout.argtypes = [c_void_p, c_int]
+        self.lib.get_session_timeout.argtypes = [c_void_p]
+        self.lib.get_session_timeout.restype = c_int
+        self.lib.is_auto_cleanup_enabled.argtypes = [c_void_p]
+        self.lib.is_auto_cleanup_enabled.restype = c_int
+        
         # Create wrapper instance
         self.wrapper = self.lib.create_wrapper()
         self.lib.set_debug_mode(self.wrapper, 1 if debug_mode else 0)
@@ -95,6 +104,26 @@ class SenseVoiceStreaming:
     def reset(self):
         """Reset the internal state"""
         self.lib.reset_wrapper(self.wrapper)
+    
+    def start_auto_cleanup(self, timeout_seconds=300, check_interval_seconds=30):
+        """Start automatic cleanup of expired sessions"""
+        self.lib.start_auto_cleanup(self.wrapper, timeout_seconds, check_interval_seconds)
+    
+    def stop_auto_cleanup(self):
+        """Stop automatic cleanup"""
+        self.lib.stop_auto_cleanup(self.wrapper)
+    
+    def set_session_timeout(self, timeout_seconds):
+        """Set session timeout in seconds"""
+        self.lib.set_session_timeout(self.wrapper, timeout_seconds)
+    
+    def get_session_timeout(self):
+        """Get current session timeout setting"""
+        return self.lib.get_session_timeout(self.wrapper)
+    
+    def is_auto_cleanup_enabled(self):
+        """Check if auto cleanup is enabled"""
+        return self.lib.is_auto_cleanup_enabled(self.wrapper) != 0
 
 
 def process_audio_streaming(recognizer, audio_path, print_decode=True):
@@ -212,6 +241,10 @@ if __name__ == "__main__":
     
     print("✅ Model initialized successfully")
     
+    # Start auto cleanup for session management
+    print("🔧 Starting auto cleanup (timeout: 300s, check interval: 30s)")
+    recognizer.start_auto_cleanup(timeout_seconds=300, check_interval_seconds=30)
+    
     # Process audio file
     audio_path = "/root/sherpa-onnx/audios/girl-zh.wav"
     
@@ -221,3 +254,7 @@ if __name__ == "__main__":
     
     print(f"Processing audio file: {audio_path}")
     process_audio_streaming(recognizer, audio_path)
+    
+    # Stop auto cleanup before exit
+    print("🔧 Stopping auto cleanup")
+    recognizer.stop_auto_cleanup()

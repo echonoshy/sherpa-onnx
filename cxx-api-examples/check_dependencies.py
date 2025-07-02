@@ -137,8 +137,8 @@ if __name__ == "__main__":
     if not success:
         print("\n❌ Library verification failed!")
         print("\nTry running the build script:")
-        print("chmod +x /root/sherpa-onnx/cxx-api-examples/build_static.sh")
-        print("/root/sherpa-onnx/cxx-api-examples/build_static.sh")
+        print("chmod +x ./build_static_sensevoice_streaming_wrapper.sh")
+        print("./build_static_sensevoice_streaming_wrapper.sh")
         sys.exit(1)
     else:
         print("\n✅ Library verification passed!")
