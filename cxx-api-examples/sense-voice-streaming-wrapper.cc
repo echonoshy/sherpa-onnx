@@ -53,9 +53,6 @@ private:
     bool debug_mode_;
     float intermediate_decode_interval_;
     
-    // 添加默认会话ID用于向后兼容
-    std::string default_session_id_;
-
     // 添加自动清理相关成员
     std::atomic<bool> auto_cleanup_enabled_;
     std::atomic<int> session_timeout_seconds_;
@@ -216,6 +213,7 @@ public:
         session->buffer.insert(session->buffer.end(), chunk.begin(), chunk.end());
         
         std::string result;
+        bool has_final_result = false;  // 标记是否有最终结果
         
         // Process VAD on the buffer
         while (session->offset + window_size_ < session->buffer.size()) {
@@ -224,9 +222,6 @@ public:
                 session->started = true;
                 session->started_time = std::chrono::steady_clock::now();
                 session->last_intermediate_result.clear();
-                if (debug_mode_) {
-                    std::cout << "[DEBUG] Session " << session_id << ": Speech detected" << std::endl;
-                }
             }
             session->offset += window_size_;
         }
@@ -240,8 +235,39 @@ public:
             }
         }
 
-        // Intermediate decoding every 0.2s during speech
-        if (session->started) {
+        // Process completed VAD segments first (highest priority)
+        while (!session->vad->IsEmpty()) {
+            auto segment = session->vad->Front();
+            session->vad->Pop();
+
+            // 当判断到端点的时候，清除中间结果，因为此时以端点的检测结果为准
+            session->last_intermediate_result.clear();
+            
+            using namespace sherpa_onnx::cxx;
+            OfflineStream stream = recognizer_->CreateStream();
+            stream.AcceptWaveform(expected_sample_rate_, segment.samples.data(),
+                                segment.samples.size());
+            recognizer_->Decode(&stream);
+            
+            OfflineRecognizerResult recognition_result = recognizer_->GetResult(&stream);
+            if (!recognition_result.text.empty()) {
+                std::string final_result = "[final] " + recognition_result.text;
+                if (!result.empty()) {
+                    result += " | ";
+                }
+                result += final_result;
+                has_final_result = true;
+            }
+            
+            // Reset state for next segment
+            session->buffer.clear();
+            session->offset = 0;
+            session->started = false;
+            session->last_intermediate_result.clear();
+        }
+
+        // Only do intermediate decoding if no final result was produced
+        if (!has_final_result && session->started) {
             auto current_time = std::chrono::steady_clock::now();
             float elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 current_time - session->started_time).count() / 1000.0f;
@@ -257,49 +283,14 @@ public:
                     if (recognition_result.text != session->last_intermediate_result) {
                         result = "[intermediate] " + recognition_result.text;
                         session->last_intermediate_result = recognition_result.text;
-                        if (debug_mode_) {
-                            std::cout << "[DEBUG] Session " << session_id << " intermediate: '" 
-                                      << recognition_result.text << "'" << std::endl;
-                        }
                     }
                 }
                 session->started_time = current_time;
             }
         }
 
-        // Process completed VAD segments
-        while (!session->vad->IsEmpty()) {
-            auto segment = session->vad->Front();
-            session->vad->Pop();
-            
-            using namespace sherpa_onnx::cxx;
-            OfflineStream stream = recognizer_->CreateStream();
-            stream.AcceptWaveform(expected_sample_rate_, segment.samples.data(),
-                                segment.samples.size());
-            recognizer_->Decode(&stream);
-            
-            OfflineRecognizerResult recognition_result = recognizer_->GetResult(&stream);
-            if (!recognition_result.text.empty()) {
-                std::string final_result = "[final] " + recognition_result.text;
-                if (!result.empty()) {
-                    result += " | ";
-                }
-                result += final_result;
-                if (debug_mode_) {
-                    std::cout << "[DEBUG] Session " << session_id << " final: '" 
-                              << recognition_result.text << "'" << std::endl;
-                }
-            }
-            
-            // Reset state for next segment
-            session->buffer.clear();
-            session->offset = 0;
-            session->started = false;
-            session->last_intermediate_result.clear();
-        }
-
         // If is_last is true, force process remaining buffer as final result
-        if (is_last && session->started && !session->buffer.empty()) {
+        if (is_last && session->started && !session->buffer.empty() && !has_final_result) {
             using namespace sherpa_onnx::cxx;
             OfflineStream stream = recognizer_->CreateStream();
             stream.AcceptWaveform(expected_sample_rate_, session->buffer.data(), session->buffer.size());
@@ -312,10 +303,6 @@ public:
                     result += " | ";
                 }
                 result += final_result;
-                if (debug_mode_) {
-                    std::cout << "[DEBUG] Session " << session_id << " forced final: '" 
-                              << recognition_result.text << "'" << std::endl;
-                }
             }
             
             // Reset state
@@ -367,40 +354,6 @@ public:
             } else {
                 ++it;
             }
-        }
-    }
-
-    // 向后兼容的单会话API
-    std::string ProcessChunk(const char* audio_data, int32_t num_samples, bool is_last = false) {
-        // 如果没有默认会话，创建一个
-        if (default_session_id_.empty()) {
-            default_session_id_ = "default_session";
-            std::string create_result = CreateSession(default_session_id_);
-            if (create_result != "OK") {
-                return "Failed to create default session: " + create_result;
-            }
-        }
-        
-        return ProcessChunkForSession(default_session_id_, audio_data, num_samples, is_last);
-    }
-    
-    std::string FlushRemaining() {
-        if (default_session_id_.empty()) {
-            return "";
-        }
-        
-        // 发送空音频块并标记为最后一块
-        std::vector<int16_t> silence(1600, 0);  // 0.1秒的静音
-        return ProcessChunkForSession(default_session_id_, 
-                                    reinterpret_cast<const char*>(silence.data()), 
-                                    silence.size(), 
-                                    true);
-    }
-    
-    void Reset() {
-        if (!default_session_id_.empty()) {
-            DestroySession(default_session_id_);
-            default_session_id_.clear();
         }
     }
 
@@ -538,26 +491,6 @@ extern "C" {
     
     EXPORT void set_debug_mode(SenseVoiceStreamingWrapper* wrapper, int debug) {
         wrapper->SetDebugMode(debug != 0);
-    }
-    
-    // 向后兼容的单会话API
-    EXPORT const char* process_chunk(SenseVoiceStreamingWrapper* wrapper,
-                                   const char* audio_data,
-                                   int num_samples,
-                                   int is_last) {
-        static thread_local std::string result;
-        result = wrapper->ProcessChunk(audio_data, num_samples, is_last != 0);
-        return result.c_str();
-    }
-    
-    EXPORT const char* flush_remaining(SenseVoiceStreamingWrapper* wrapper) {
-        static thread_local std::string result;
-        result = wrapper->FlushRemaining();
-        return result.c_str();
-    }
-    
-    EXPORT void reset_wrapper(SenseVoiceStreamingWrapper* wrapper) {
-        wrapper->Reset();
     }
     
     EXPORT void cleanup_expired_sessions(SenseVoiceStreamingWrapper* wrapper, int timeout_seconds) {

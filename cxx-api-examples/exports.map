@@ -2,16 +2,11 @@
   global:
     create_wrapper;
     destroy_wrapper;
-    init_model;
     init_model_with_params;
     create_session;
     process_chunk_for_session_safe;
     destroy_session;
     get_active_session_count;
-    set_debug_mode;
-    process_chunk;
-    flush_remaining;
-    reset_wrapper;
     cleanup_expired_sessions;
     start_auto_cleanup;
     stop_auto_cleanup;
