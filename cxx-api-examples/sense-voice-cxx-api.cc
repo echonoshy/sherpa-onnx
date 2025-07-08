@@ -68,6 +68,11 @@ int32_t main() {
   float rtf = elapsed_seconds / duration;
 
   std::cout << "text: " << result.text << "\n";
+  std::cout << "timestamps: ";
+  for (const auto& val : result.timestamps) {
+      std::cout << val << " ";
+  }
+  std::cout << "\n";
   printf("Number of threads: %d\n", config.model_config.num_threads);
   printf("Duration: %.3fs\n", duration);
   printf("Elapsed seconds: %.3fs\n", elapsed_seconds);

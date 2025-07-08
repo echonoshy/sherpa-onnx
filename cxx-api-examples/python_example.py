@@ -4,6 +4,7 @@ import os
 import wave
 import time
 import sys
+import json
 from ctypes import c_char_p, c_int, c_void_p, POINTER
 
 class SenseVoiceStreaming:
@@ -42,6 +43,14 @@ class SenseVoiceStreaming:
         self.lib.is_auto_cleanup_enabled.restype = c_int
         self.lib.cleanup_expired_sessions.argtypes = [c_void_p, c_int]
         
+        # Add function signatures for new methods
+        self.lib.set_intermediate_decode_samples.argtypes = [c_void_p, c_int]
+        self.lib.get_intermediate_decode_samples.argtypes = [c_void_p]
+        self.lib.get_intermediate_decode_samples.restype = c_int
+        self.lib.set_vad_process_threshold.argtypes = [c_void_p, c_int]
+        self.lib.get_vad_process_threshold.argtypes = [c_void_p]
+        self.lib.get_vad_process_threshold.restype = c_int
+        
         # Create wrapper instance
         self.wrapper = self.lib.create_wrapper()
         
@@ -54,8 +63,8 @@ class SenseVoiceStreaming:
 
     def init_model_with_params(self, vad_model_path, sense_voice_model_path, tokens_path,
                              vad_threshold=0.5,
-                             min_silence_duration=0.5,      # 值越大，越不容易把句子切碎，字准会稍微高一点，但是计算量变大。
-                             min_speech_duration=0.1,        # 值太大，会漏掉一些字。
+                             min_silence_duration=0.5,       # 值越大，句子越完整，字准会稍微高一点，但是计算量变大。
+                             min_speech_duration=0.25,       # 值太大，会漏掉一些字，数值太小，计算量变大。
                              max_speech_duration=8.0,        # 最大分句长度，目前看影响并不明显。
                              sample_rate=16000,
                              use_itn=True,
@@ -148,6 +157,72 @@ class SenseVoiceStreaming:
     def is_auto_cleanup_enabled(self):
         """Check if auto cleanup is enabled"""
         return self.lib.is_auto_cleanup_enabled(self.wrapper) != 0
+    
+    def set_intermediate_decode_samples(self, samples):
+        """Set the number of samples for intermediate decoding"""
+        self.lib.set_intermediate_decode_samples(self.wrapper, samples)
+    
+    def get_intermediate_decode_samples(self):
+        """Get the current number of samples for intermediate decoding"""
+        return self.lib.get_intermediate_decode_samples(self.wrapper)
+    
+    def set_vad_process_threshold(self, min_samples):
+        """Set the minimum samples threshold for VAD processing"""
+        self.lib.set_vad_process_threshold(self.wrapper, min_samples)
+    
+    def get_vad_process_threshold(self):
+        """Get the current VAD processing threshold"""
+        return self.lib.get_vad_process_threshold(self.wrapper)
+    
+    def set_intermediate_decode_interval(self, seconds):
+        """Set intermediate decode interval in seconds (convenience method)"""
+        samples = int(seconds * 16000)  # Assuming 16kHz sample rate
+        self.set_intermediate_decode_samples(samples)
+    
+    def get_intermediate_decode_interval(self):
+        """Get intermediate decode interval in seconds (convenience method)"""
+        samples = self.get_intermediate_decode_samples()
+        return samples / 16000.0  # Assuming 16kHz sample rate
+
+
+def parse_result(result_str):
+    """Parse JSON result from C++ wrapper"""
+    if not result_str or result_str.startswith("Error:"):
+        return None
+    
+    try:
+        # Handle multiple results separated by " | "
+        if " | " in result_str:
+            results = []
+            for part in result_str.split(" | "):
+                parsed = json.loads(part.strip())
+                results.append(parsed)
+            return results
+        else:
+            return json.loads(result_str)
+    except json.JSONDecodeError:
+        # Fallback for old format compatibility
+        if "[intermediate]" in result_str:
+            return {"type": "intermediate", "text": result_str.replace("[intermediate] ", "").strip(), "timestamps": []}
+        elif "[final]" in result_str:
+            return {"type": "final", "text": result_str.replace("[final] ", "").strip(), "timestamps": []}
+        else:
+            return {"type": "unknown", "text": result_str.strip(), "timestamps": []}
+
+
+def format_timestamps(timestamps):
+    """Format timestamps for display as time intervals"""
+    if not timestamps or len(timestamps) < 2:
+        return ""
+    
+    # Convert single timestamps to time intervals [start, end]
+    intervals = []
+    for i in range(len(timestamps) - 1):
+        intervals.append([timestamps[i], timestamps[i + 1]])
+    
+    # Format as string
+    interval_strs = [f"[{start:.2f}, {end:.2f}]" for start, end in intervals]
+    return f" [timestamps: {', '.join(interval_strs)}]"
 
 
 def process_audio_streaming(recognizer, audio_path, session_id="default", print_decode=True):
@@ -159,6 +234,9 @@ def process_audio_streaming(recognizer, audio_path, session_id="default", print_
         print(f"❌ Failed to create session: {result}")
         return
     
+    # Record start time for RTF calculation (only processing time, not I/O)
+    total_processing_time = 0
+    
     try:
         with wave.open(audio_path, 'rb') as wav_file:
             # Check audio parameters
@@ -166,14 +244,21 @@ def process_audio_streaming(recognizer, audio_path, session_id="default", print_
             assert wav_file.getsampwidth() == 2, "Only 16-bit audio is supported"
             file_sample_rate = wav_file.getframerate()
             
+            # Calculate total audio duration for RTF calculation
+            total_audio_frames = wav_file.getnframes()
+            audio_duration = total_audio_frames / file_sample_rate
+            
             if print_decode:
-                print(f"Audio parameters: sample_rate={file_sample_rate}Hz")
+                print(f"Audio parameters: sample_rate={file_sample_rate}Hz, duration={audio_duration:.2f}s")
                 print(f"Session ID: {session_id}")
                 print("Starting streaming processing...")
                 print("=" * 60)
             
+            # Reset file position to beginning
+            wav_file.rewind()
+            
             # Process audio chunks
-            chunk_duration = 0.2  # 0.2 second chunks
+            chunk_duration = 1  # 0.2 second chunks
             frames_per_chunk = int(chunk_duration * file_sample_rate)
             
             total_frames = 0
@@ -182,49 +267,74 @@ def process_audio_streaming(recognizer, audio_path, session_id="default", print_
             while True:
                 audio_chunk = wav_file.readframes(frames_per_chunk)
                 if not audio_chunk:
-                    # End of file, get final result
+                    # End of file, get Chunk Result
+                    processing_start = time.time()
                     final_result = recognizer.process_chunk_for_session(session_id, b'\x00\x00', is_last=True)
+                    processing_end = time.time()
+                    total_processing_time += (processing_end - processing_start)
+                    
                     if final_result:
-                        final_result = final_result.split("[final]")[-1].strip()
-                        current_time = total_frames / file_sample_rate
-                        if print_decode:
-                            if current_intermediate:
-                                print()  # Clear intermediate result line
-                            print(f"[{current_time:6.2f}s] (✓ Chunk Result): {final_result}")
+                        parsed_result = parse_result(final_result)
+                        if parsed_result:
+                            current_time = total_frames / file_sample_rate
+                            if isinstance(parsed_result, list):
+                                for result_item in parsed_result:
+                                    if result_item["type"] == "final" and result_item["text"]:
+                                        timestamps_str = format_timestamps(result_item["timestamps"]) if result_item["timestamps"] else ""
+                                        if print_decode:
+                                            if current_intermediate:
+                                                print()  # Clear intermediate result line
+                                            print(f"[{current_time:6.2f}s] (✓ Chunk Result): {result_item['text']}{timestamps_str}")
+                            else:
+                                if parsed_result["type"] == "final" and parsed_result["text"]:
+                                    timestamps_str = format_timestamps(parsed_result["timestamps"]) if parsed_result["timestamps"] else ""
+                                    if print_decode:
+                                        if current_intermediate:
+                                            print()  # Clear intermediate result line
+                                        print(f"[{current_time:6.2f}s] (✓ Chunk Result): {parsed_result['text']}{timestamps_str}")
                     break
                 
                 # Process current audio chunk
+                processing_start = time.time()
                 result = recognizer.process_chunk_for_session(session_id, audio_chunk)
+                processing_end = time.time()
+                total_processing_time += (processing_end - processing_start)
                 
                 if result:
-                    current_time = total_frames / file_sample_rate
-                    
-                    # Parse result type
-                    if "[intermediate]" in result:
-                        # Intermediate result - real-time update display
-                        text = result.replace("[intermediate] ", "").strip()
-                        if text != current_intermediate:
-                            current_intermediate = text
-                            if print_decode:
-                                print(f"\r[{current_time:6.2f}s] (Recognizing): {text:<80}", end="", flush=True)
-                    
-                    elif "[final]" in result or result.strip():
-                        # Final result - display complete content with newline
-                        if current_intermediate and print_decode:
-                            print()  # Clear intermediate result line
+                    parsed_result = parse_result(result)
+                    if parsed_result:
+                        current_time = total_frames / file_sample_rate
                         
-                        # Extract final text, handle possible format issues
-                        if "[final]" in result:
-                            final_text = result.split("[final]")[-1].strip()
-                        else:
-                            final_text = result.strip()
-                        if final_text and print_decode:
-                            print(f"[{current_time:6.2f}s] (✓ Chunk Result): {final_text}")
+                        # Handle multiple results
+                        results_to_process = parsed_result if isinstance(parsed_result, list) else [parsed_result]
                         
-                        current_intermediate = ""  # Clear intermediate result
+                        for result_item in results_to_process:
+                            if result_item["type"] == "intermediate":
+                                # Intermediate result - real-time update display (no timestamps)
+                                text = result_item["text"]
+                                if text != current_intermediate:
+                                    current_intermediate = text
+                                    if print_decode:
+                                        print(f"\r[{current_time:6.2f}s] (Recognizing): {text:<80}", end="", flush=True)
+                            
+                            elif result_item["type"] == "final":
+                                # Chunk Result - display with timestamps if available
+                                if current_intermediate and print_decode:
+                                    print()  # Clear intermediate result line
+                                
+                                final_text = result_item["text"]
+                                if final_text and print_decode:
+                                    # Only show timestamps for Chunk Results (VAD endpoints)
+                                    timestamps_str = format_timestamps(result_item["timestamps"]) if result_item["timestamps"] else ""
+                                    print(f"[{current_time:6.2f}s] (✓ Chunk Result): {final_text}{timestamps_str}")
+                                
+                                current_intermediate = ""  # Clear intermediate result
                 
                 total_frames += frames_per_chunk
-                time.sleep(0.01)  # Simulate real-time processing delay
+                # time.sleep(0.02)#   Simulate real-time processing delay
+            
+            # Calculate RTF (Real Time Factor) - only based on actual processing time
+            rtf = total_processing_time / audio_duration if audio_duration > 0 else 0
             
             # Ensure final newline
             if current_intermediate:
@@ -233,6 +343,13 @@ def process_audio_streaming(recognizer, audio_path, session_id="default", print_
             if print_decode:
                 print("=" * 60)
                 print("Audio processing completed")
+                print(f"Audio duration: {audio_duration:.2f}s")
+                print(f"Total processing time: {total_processing_time:.2f}s")
+                print(f"RTF (Real Time Factor): {rtf:.3f}")
+                if rtf < 1.0:
+                    print("✅ Real-time processing achieved (RTF < 1.0)")
+                else:
+                    print("⚠️  Processing slower than real-time (RTF > 1.0)")
                 print(f"Active sessions: {recognizer.get_active_session_count()}")
     
     finally:
@@ -250,31 +367,17 @@ if __name__ == "__main__":
     # Initialize recognizer
     try:
         recognizer = SenseVoiceStreaming()
+        recognizer.set_intermediate_decode_samples(16000) # 中间解码的最小样本数
+        recognizer.set_vad_process_threshold(1024)  # vad 处理的最小样本数
     except FileNotFoundError as e:
         print(f"❌ {e}")
         sys.exit(1)
     
-    # Model paths
-    model_paths = {
-        "vad_model": "./sherpa-onnx-weights/silero_vad.onnx",
-        "sense_voice_model": "./sherpa-onnx-weights/model.onnx",
-        "tokens": "./sherpa-onnx-weights/tokens.txt"
-    }
-    
-    # Check model files
-    for name, path in model_paths.items():
-        if not os.path.exists(path):
-            print(f"❌ Missing {name}: {path}")
-            sys.exit(1)
-    
 
     success = recognizer.init_model_with_params(
-            vad_model_path="sherpa-onnx-weights/silero_vad.onnx",
-            sense_voice_model_path="sherpa-onnx-weights/model.onnx",
-            tokens_path="sherpa-onnx-weights/tokens.txt",
-            vad_threshold=0.5,
-            language="auto",
-            num_threads=1
+            vad_model_path="sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/silero_vad.onnx",
+            sense_voice_model_path="sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.onnx",
+            tokens_path="sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt",
         )
 
     if not success:
@@ -289,7 +392,8 @@ if __name__ == "__main__":
     
     # Process audio file
     # audio_path = "exps/audios/Audiodata_2025_3/地铁-英文现场录音-15条/地铁-英文现场录音-1-2.wav"
-    audio_path = "/home/lake/gitcodes/asr-sherpa-onnx/4022654511881686103_16k.wav"
+    # audio_path = "/root/sherpa-onnx/audios/girl-zh.wav"
+    audio_path = "/root/sherpa-onnx/audios/meeting-zh.wav"
     
     if not os.path.exists(audio_path):
         print(f"❌ Audio file not found: {audio_path}")

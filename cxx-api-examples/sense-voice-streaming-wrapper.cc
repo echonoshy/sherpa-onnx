@@ -12,6 +12,7 @@
 #include <cstring>  // for strcpy
 #include <thread>   // 添加线程支持
 #include <atomic>   // 添加原子操作支持
+#include <sstream>  // 添加字符串流支持
 
 #include "sherpa-onnx/c-api/cxx-api.h"
 
@@ -50,14 +51,15 @@ private:
     int32_t expected_sample_rate_;
     int32_t window_size_;
     bool initialized_;
-    bool debug_mode_;
-    float intermediate_decode_interval_;
+    int32_t intermediate_decode_samples_;  // 替代 intermediate_decode_interval_
     
     // 添加自动清理相关成员
     std::atomic<bool> auto_cleanup_enabled_;
     std::atomic<int> session_timeout_seconds_;
     std::unique_ptr<std::thread> cleanup_thread_;
     std::atomic<bool> stop_cleanup_thread_;
+    
+    int32_t min_vad_process_samples_;  // 最小VAD处理样本数阈值
     
     // 自动清理线程函数
     void AutoCleanupThread() {
@@ -71,12 +73,38 @@ private:
         }
     }
 
+    // 辅助函数：将时间戳向量转换为字符串
+    std::string TimestampsToString(const std::vector<float>& timestamps) {
+        if (timestamps.empty()) {
+            return "[]";
+        }
+        
+        std::ostringstream oss;
+        oss << "[";
+        for (size_t i = 0; i < timestamps.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << timestamps[i];
+        }
+        oss << "]";
+        return oss.str();
+    }
+    
+    // 辅助函数：创建包含文本和时间戳的JSON格式结果
+    std::string CreateResultJson(const std::string& type, const std::string& text, 
+                                const std::vector<float>& timestamps) {
+        std::ostringstream oss;
+        oss << "{\"type\":\"" << type << "\",\"text\":\"" << text 
+            << "\",\"timestamps\":" << TimestampsToString(timestamps) << "}";
+        return oss.str();
+    }
+
 public:
     SenseVoiceStreamingWrapper() 
         : expected_sample_rate_(16000), window_size_(512), initialized_(false),
-          debug_mode_(false), intermediate_decode_interval_(0.2),
+          intermediate_decode_samples_(3200),  // 0.2秒 * 16000 = 3200 samples
           auto_cleanup_enabled_(false), session_timeout_seconds_(300),
-          stop_cleanup_thread_(false) {}
+          stop_cleanup_thread_(false),
+          min_vad_process_samples_(1024) {}  // 默认2个窗口
     
     ~SenseVoiceStreamingWrapper() {
         // 停止自动清理线程
@@ -169,10 +197,6 @@ public:
         
         sessions_[session_id] = session;
         
-        if (debug_mode_) {
-            std::cout << "[DEBUG] Created session: " << session_id << std::endl;
-        }
-        
         return "OK";
     }
     
@@ -182,7 +206,7 @@ public:
                                      int32_t num_samples, 
                                      bool is_last = false) {
         if (!initialized_) {
-            return "Model not initialized";
+            return "{\"type\":\"error\",\"text\":\"Model not initialized\",\"timestamps\":[]}";
         }
         
         // 安全地获取会话的共享指针
@@ -191,7 +215,7 @@ public:
             std::lock_guard<std::mutex> sessions_lock(sessions_mutex_);
             auto it = sessions_.find(session_id);
             if (it == sessions_.end()) {
-                return "Session not found";
+                return "{\"type\":\"error\",\"text\":\"Session not found\",\"timestamps\":[]}";
             }
             session = it->second;  // 获取共享指针
         }
@@ -215,15 +239,21 @@ public:
         std::string result;
         bool has_final_result = false;  // 标记是否有最终结果
         
-        // Process VAD on the buffer
-        while (session->offset + window_size_ < session->buffer.size()) {
-            session->vad->AcceptWaveform(session->buffer.data() + session->offset, window_size_);
-            if (!session->started && session->vad->IsDetected()) {
-                session->started = true;
-                session->started_time = std::chrono::steady_clock::now();
-                session->last_intermediate_result.clear();
+        // 优化：只有当buffer中有足够数据时才进行VAD处理
+        // 避免频繁的小片段VAD计算
+        const int32_t min_vad_process_samples = window_size_ * 2;  // 至少2个窗口的数据
+        
+        // Process VAD on the buffer - 优化版本
+        if (session->buffer.size() - session->offset >= min_vad_process_samples || is_last) {
+            while (session->offset + window_size_ <= session->buffer.size()) {
+                session->vad->AcceptWaveform(session->buffer.data() + session->offset, window_size_);
+                if (!session->started && session->vad->IsDetected()) {
+                    session->started = true;
+                    session->started_time = std::chrono::steady_clock::now();
+                    session->last_intermediate_result.clear();
+                }
+                session->offset += window_size_;
             }
-            session->offset += window_size_;
         }
 
         // Trim buffer if no speech detected for a while
@@ -251,7 +281,8 @@ public:
             
             OfflineRecognizerResult recognition_result = recognizer_->GetResult(&stream);
             if (!recognition_result.text.empty()) {
-                std::string final_result = "[final] " + recognition_result.text;
+                std::string final_result = CreateResultJson("final", recognition_result.text, 
+                                                           recognition_result.timestamps);
                 if (!result.empty()) {
                     result += " | ";
                 }
@@ -266,26 +297,38 @@ public:
             session->last_intermediate_result.clear();
         }
 
-        // Only do intermediate decoding if no final result was produced
+        // 改为基于音频数据量的中间解码逻辑
         if (!has_final_result && session->started) {
-            auto current_time = std::chrono::steady_clock::now();
-            float elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                current_time - session->started_time).count() / 1000.0f;
+            // 计算从开始检测到语音后累积的样本数
+            int32_t accumulated_samples = session->buffer.size();
             
-            if (elapsed > intermediate_decode_interval_) {
+            // 只要累积的样本数达到设定阈值就进行中间解码，不再限制当前传入的音频片段长度
+            if (accumulated_samples >= intermediate_decode_samples_) {
                 using namespace sherpa_onnx::cxx;
                 OfflineStream stream = recognizer_->CreateStream();
+                // 使用完整的buffer进行解码，保持前文信息
                 stream.AcceptWaveform(expected_sample_rate_, session->buffer.data(), session->buffer.size());
                 recognizer_->Decode(&stream);
                 
                 OfflineRecognizerResult recognition_result = recognizer_->GetResult(&stream);
                 if (!recognition_result.text.empty()) {
                     if (recognition_result.text != session->last_intermediate_result) {
-                        result = "[intermediate] " + recognition_result.text;
+                        result = CreateResultJson("intermediate", recognition_result.text, 
+                                                recognition_result.timestamps);
                         session->last_intermediate_result = recognition_result.text;
                     }
                 }
-                session->started_time = current_time;
+                
+                // 不要截断buffer，保持完整的上下文
+                // 只有当buffer过大时才进行适当的清理
+                const int32_t max_buffer_size = expected_sample_rate_ * 20; // 最大保持30秒
+                if (session->buffer.size() > max_buffer_size) {
+                    // 保留最后10秒的数据
+                    int32_t keep_samples = expected_sample_rate_ * 10;
+                    std::vector<float> new_buffer(session->buffer.end() - keep_samples, session->buffer.end());
+                    session->buffer = std::move(new_buffer);
+                    session->offset = std::max(0, session->offset - (accumulated_samples - keep_samples));
+                }
             }
         }
 
@@ -298,7 +341,8 @@ public:
             
             OfflineRecognizerResult recognition_result = recognizer_->GetResult(&stream);
             if (!recognition_result.text.empty()) {
-                std::string final_result = "[final] " + recognition_result.text;
+                std::string final_result = CreateResultJson("final", recognition_result.text, 
+                                                           recognition_result.timestamps);
                 if (!result.empty()) {
                     result += " | ";
                 }
@@ -320,9 +364,6 @@ public:
         std::lock_guard<std::mutex> lock(sessions_mutex_);
         auto it = sessions_.find(session_id);
         if (it != sessions_.end()) {
-            if (debug_mode_) {
-                std::cout << "[DEBUG] Destroyed session: " << session_id << std::endl;
-            }
             sessions_.erase(it);
         }
     }
@@ -331,10 +372,6 @@ public:
     int GetActiveSessionCount() {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
         return sessions_.size();
-    }
-
-    void SetDebugMode(bool debug) {
-        debug_mode_ = debug;
     }
 
     // 添加清理过期会话的方法
@@ -347,9 +384,6 @@ public:
                 now - it->second->last_activity).count();
             
             if (elapsed > timeout_seconds) {
-                if (debug_mode_) {
-                    std::cout << "[DEBUG] Cleaning up expired session: " << it->first << std::endl;
-                }
                 it = sessions_.erase(it);
             } else {
                 ++it;
@@ -376,11 +410,6 @@ public:
                 }
             }
         });
-        
-        if (debug_mode_) {
-            std::cout << "[DEBUG] Auto cleanup started with timeout: " << timeout_seconds 
-                      << "s, check interval: " << check_interval_seconds << "s" << std::endl;
-        }
     }
     
     // 停止自动清理
@@ -392,18 +421,11 @@ public:
             cleanup_thread_->join();
             cleanup_thread_.reset();
         }
-        
-        if (debug_mode_) {
-            std::cout << "[DEBUG] Auto cleanup stopped" << std::endl;
-        }
     }
     
     // 设置会话超时时间
     void SetSessionTimeout(int timeout_seconds) {
         session_timeout_seconds_.store(timeout_seconds);
-        if (debug_mode_) {
-            std::cout << "[DEBUG] Session timeout set to: " << timeout_seconds << "s" << std::endl;
-        }
     }
     
     // 获取当前超时设置
@@ -414,6 +436,30 @@ public:
     // 检查自动清理是否启用
     bool IsAutoCleanupEnabled() const {
         return auto_cleanup_enabled_.load();
+    }
+
+    // 添加设置中间解码样本数的方法
+    void SetIntermediateDecodeSamples(int32_t samples) {
+        intermediate_decode_samples_ = samples;
+    }
+    
+    // // 设置中间解码的音频长度（秒）
+    // void SetIntermediateDecodeInterval(float seconds) {
+    //     intermediate_decode_samples_ = static_cast<int32_t>(seconds * expected_sample_rate_);
+    // }
+    
+    // 获取当前设置的中间解码样本数
+    int32_t GetIntermediateDecodeSamples() const {
+        return intermediate_decode_samples_;
+    }
+
+    // 添加配置VAD处理阈值的方法
+    void SetVadProcessThreshold(int32_t min_samples) {
+        min_vad_process_samples_ = min_samples;
+    }
+    
+    int32_t GetVadProcessThreshold() const {
+        return min_vad_process_samples_;
     }
 };
 
@@ -489,10 +535,6 @@ extern "C" {
         return wrapper->GetActiveSessionCount();
     }
     
-    EXPORT void set_debug_mode(SenseVoiceStreamingWrapper* wrapper, int debug) {
-        wrapper->SetDebugMode(debug != 0);
-    }
-    
     EXPORT void cleanup_expired_sessions(SenseVoiceStreamingWrapper* wrapper, int timeout_seconds) {
         wrapper->CleanupExpiredSessions(timeout_seconds);
     }
@@ -518,5 +560,23 @@ extern "C" {
     
     EXPORT int is_auto_cleanup_enabled(SenseVoiceStreamingWrapper* wrapper) {
         return wrapper->IsAutoCleanupEnabled() ? 1 : 0;
+    }
+    
+    EXPORT void set_intermediate_decode_samples(SenseVoiceStreamingWrapper* wrapper, 
+                                               int32_t samples) {
+        wrapper->SetIntermediateDecodeSamples(samples);
+    }
+    
+    EXPORT int32_t get_intermediate_decode_samples(SenseVoiceStreamingWrapper* wrapper) {
+        return wrapper->GetIntermediateDecodeSamples();
+    }
+    
+    EXPORT void set_vad_process_threshold(SenseVoiceStreamingWrapper* wrapper, 
+                                         int32_t min_samples) {
+        wrapper->SetVadProcessThreshold(min_samples);
+    }
+    
+    EXPORT int32_t get_vad_process_threshold(SenseVoiceStreamingWrapper* wrapper) {
+        return wrapper->GetVadProcessThreshold();
     }
 } 

@@ -8,8 +8,8 @@ echo "Building sherpa-onnx with static linking..."
 cd /root/sherpa-onnx
 
 # 清理之前的构建
-rm -rf build
-mkdir -p build
+# rm -rf build
+# mkdir -p build
 cd build
 
 # 配置CMake with 静态链接偏好
