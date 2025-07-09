@@ -240,37 +240,56 @@ public:
         std::string result;
         bool has_final_result = false;  // 标记是否有最终结果
         
-        // 记录VAD处理前的buffer大小
-        int32_t buffer_size_before_vad = session->buffer.size();
-        
-        while (session->offset + window_size_ <= session->buffer.size()) {
+        // VAD处理逻辑 - 参考参考文件的处理方式
+        for (; session->offset + window_size_ <= session->buffer.size(); session->offset += window_size_) {
             session->vad->AcceptWaveform(session->buffer.data() + session->offset, window_size_);
             if (!session->started && session->vad->IsDetected()) {
                 session->started = true;
                 session->started_time = std::chrono::steady_clock::now();
                 session->last_intermediate_result.clear();
+                // 重置VAD处理的采样计数器
+                session->vad_processed_samples = 0;
             }
-            session->offset += window_size_;
-            session->vad_processed_samples += window_size_;
         }
 
-        // Trim buffer if no speech detected for a while
+        // 更安全的buffer修剪逻辑 - 参考参考文件
         if (!session->started) {
-            // 大幅增加buffer大小，确保不丢失语音开始部分
-            if (session->buffer.size() > 60 * window_size_) {  // 约3.8秒
-                int keep_samples = 45 * window_size_;  // 约2.9秒
-                int32_t removed_samples = session->buffer.size() - keep_samples;
-                
-                session->offset -= removed_samples;
-                session->buffer = {session->buffer.end() - keep_samples, session->buffer.end()};
-                
-                // 调整vad_processed_samples
-                session->vad_processed_samples = std::max(0, 
-                    session->vad_processed_samples - removed_samples);
+            if (session->buffer.size() > 10 * window_size_) {
+                session->offset -= session->buffer.size() - 10 * window_size_;
+                session->buffer = {session->buffer.end() - 10 * window_size_, session->buffer.end()};
             }
         }
 
-        // Process completed VAD segments with correct position tracking
+        // 中间解码逻辑 - 每1秒录音数据长度(16000采样点)进行一次识别
+        if (session->started) {
+            // 计算从VAD开始到当前buffer中的总采样数
+            int32_t total_samples_since_vad_start = session->buffer.size();
+            int32_t samples_for_next_decode = session->vad_processed_samples + expected_sample_rate_;
+            
+            // 当累积的音频数据达到下一个解码点时进行中间解码
+            if (total_samples_since_vad_start >= samples_for_next_decode) {
+                using namespace sherpa_onnx::cxx;
+                OfflineStream stream = recognizer_->CreateStream();
+                
+                // 使用完整的buffer进行中间解码
+                stream.AcceptWaveform(expected_sample_rate_, session->buffer.data(), session->buffer.size());
+                recognizer_->Decode(&stream);
+                
+                OfflineRecognizerResult recognition_result = recognizer_->GetResult(&stream);
+                if (!recognition_result.text.empty()) {
+                    if (recognition_result.text != session->last_intermediate_result) {
+                        result = CreateResultJson("intermediate", recognition_result.text, 
+                                                recognition_result.timestamps);
+                        session->last_intermediate_result = recognition_result.text;
+                    }
+                }
+                
+                // 更新已处理的采样点数，为下次中间解码做准备
+                session->vad_processed_samples = samples_for_next_decode;
+            }
+        }
+
+        // Process completed VAD segments for final results
         while (!session->vad->IsEmpty()) {
             auto segment = session->vad->Front();
             session->vad->Pop();
@@ -280,10 +299,8 @@ public:
             using namespace sherpa_onnx::cxx;
             OfflineStream stream = recognizer_->CreateStream();
             
-            // 直接使用VAD段的数据，不添加额外的上下文
-            // VAD已经包含了必要的上下文信息
-            stream.AcceptWaveform(expected_sample_rate_, segment.samples.data(),
-                                segment.samples.size());
+            // 使用VAD检测到的完整语音片段进行最终解码
+            stream.AcceptWaveform(expected_sample_rate_, segment.samples.data(), segment.samples.size());
             recognizer_->Decode(&stream);
             
             OfflineRecognizerResult recognition_result = recognizer_->GetResult(&stream);
@@ -300,57 +317,8 @@ public:
             // Reset state for next segment
             session->buffer.clear();
             session->offset = 0;
-            session->vad_processed_samples = 0;
             session->started = false;
             session->last_intermediate_result.clear();
-        }
-
-        // 改为基于音频数据量的中间解码逻辑
-        if (!has_final_result && session->started) {
-            // 计算从开始检测到语音后累积的样本数
-            int32_t accumulated_samples = session->buffer.size();
-            
-            // 只要累积的样本数达到设定阈值就进行中间解码，不再限制当前传入的音频片段长度
-            if (accumulated_samples >= intermediate_decode_samples_) {
-                using namespace sherpa_onnx::cxx;
-                OfflineStream stream = recognizer_->CreateStream();
-                
-                // 关键修复：中间解码也使用相同的前置上下文逻辑
-                // 计算前置上下文长度（300ms）
-                int32_t context_samples = expected_sample_rate_ * 0.3;
-                int32_t actual_start = std::max(0, static_cast<int32_t>(session->buffer.size()) - accumulated_samples - context_samples);
-                
-                // 创建包含上下文的音频数据用于中间解码
-                std::vector<float> audio_with_context;
-                if (actual_start < session->buffer.size()) {
-                    audio_with_context.insert(audio_with_context.end(),
-                                            session->buffer.begin() + actual_start,
-                                            session->buffer.end());
-                }
-                
-                stream.AcceptWaveform(expected_sample_rate_, audio_with_context.data(), audio_with_context.size());
-                recognizer_->Decode(&stream);
-                
-                OfflineRecognizerResult recognition_result = recognizer_->GetResult(&stream);
-                if (!recognition_result.text.empty()) {
-                    if (recognition_result.text != session->last_intermediate_result) {
-                        result = CreateResultJson("intermediate", recognition_result.text, 
-                                                recognition_result.timestamps);
-                        session->last_intermediate_result = recognition_result.text;
-                    }
-                }
-                
-                // 不要截断buffer，保持完整的上下文
-                // 只有当buffer过大时才进行适当的清理
-                const int32_t max_buffer_size = expected_sample_rate_ * 12; // 最大保持12秒
-                if (session->buffer.size() > max_buffer_size) {
-                    // 保留最后10秒的数据
-                    int32_t keep_samples = expected_sample_rate_ * 10;
-                    std::vector<float> new_buffer(session->buffer.end() - keep_samples, session->buffer.end());
-                    session->buffer = std::move(new_buffer);
-                    session->offset = std::max(0, session->offset - (accumulated_samples - keep_samples));
-                }
-            }
         }
 
         // If is_last is true, force process remaining buffer as final result

@@ -60,7 +60,7 @@ class SenseVoiceStreaming:
 
     def init_model_with_params(self, vad_model_path, sense_voice_model_path, tokens_path,
                              vad_threshold=0.5,
-                             min_silence_duration=0.1,       # 值越大，句子越完整，字准会稍微高一点，但是计算量变大。
+                             min_silence_duration=0.5,       # 值越大，句子越完整，字准会稍微高一点，但是计算量变大。
                              min_speech_duration=0.25,       # 值太大，会漏掉一些字，数值太小，计算量变大。
                              max_speech_duration=8.0,        # 最大分句长度，目前看影响并不明显。
                              sample_rate=16000,
@@ -320,7 +320,6 @@ def process_audio_streaming(recognizer, audio_path, session_id="default", print_
                                 current_intermediate = ""  # Clear intermediate result
                 
                 total_frames += frames_per_chunk
-                # time.sleep(0.02)#   Simulate real-time processing delay
             
             # Calculate RTF (Real Time Factor) - only based on actual processing time
             rtf = total_processing_time / audio_duration if audio_duration > 0 else 0
@@ -380,7 +379,8 @@ if __name__ == "__main__":
     
     # Process audio file
     # audio_path = "exps/audios/Audiodata_2025_3/地铁-英文现场录音-15条/地铁-英文现场录音-1-2.wav"
-    audio_path = "/root/sherpa-onnx/audios/girl-zh.wav"
+    audio_path = "/root/sherpa-onnx/audios/hanli.wav"
+    # audio_path = "/root/sherpa-onnx/audios/girl-zh.wav"
     # audio_path = "/root/sherpa-onnx/audios/meeting-zh.wav"
     
     if not os.path.exists(audio_path):
