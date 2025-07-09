@@ -47,9 +47,6 @@ class SenseVoiceStreaming:
         self.lib.set_intermediate_decode_samples.argtypes = [c_void_p, c_int]
         self.lib.get_intermediate_decode_samples.argtypes = [c_void_p]
         self.lib.get_intermediate_decode_samples.restype = c_int
-        self.lib.set_vad_process_threshold.argtypes = [c_void_p, c_int]
-        self.lib.get_vad_process_threshold.argtypes = [c_void_p]
-        self.lib.get_vad_process_threshold.restype = c_int
         
         # Create wrapper instance
         self.wrapper = self.lib.create_wrapper()
@@ -63,7 +60,7 @@ class SenseVoiceStreaming:
 
     def init_model_with_params(self, vad_model_path, sense_voice_model_path, tokens_path,
                              vad_threshold=0.5,
-                             min_silence_duration=0.5,       # 值越大，句子越完整，字准会稍微高一点，但是计算量变大。
+                             min_silence_duration=0.1,       # 值越大，句子越完整，字准会稍微高一点，但是计算量变大。
                              min_speech_duration=0.25,       # 值太大，会漏掉一些字，数值太小，计算量变大。
                              max_speech_duration=8.0,        # 最大分句长度，目前看影响并不明显。
                              sample_rate=16000,
@@ -165,14 +162,6 @@ class SenseVoiceStreaming:
     def get_intermediate_decode_samples(self):
         """Get the current number of samples for intermediate decoding"""
         return self.lib.get_intermediate_decode_samples(self.wrapper)
-    
-    def set_vad_process_threshold(self, min_samples):
-        """Set the minimum samples threshold for VAD processing"""
-        self.lib.set_vad_process_threshold(self.wrapper, min_samples)
-    
-    def get_vad_process_threshold(self):
-        """Get the current VAD processing threshold"""
-        return self.lib.get_vad_process_threshold(self.wrapper)
     
     def set_intermediate_decode_interval(self, seconds):
         """Set intermediate decode interval in seconds (convenience method)"""
@@ -368,7 +357,6 @@ if __name__ == "__main__":
     try:
         recognizer = SenseVoiceStreaming()
         recognizer.set_intermediate_decode_samples(16000) # 中间解码的最小样本数
-        recognizer.set_vad_process_threshold(1024)  # vad 处理的最小样本数
     except FileNotFoundError as e:
         print(f"❌ {e}")
         sys.exit(1)
@@ -392,8 +380,8 @@ if __name__ == "__main__":
     
     # Process audio file
     # audio_path = "exps/audios/Audiodata_2025_3/地铁-英文现场录音-15条/地铁-英文现场录音-1-2.wav"
-    # audio_path = "/root/sherpa-onnx/audios/girl-zh.wav"
-    audio_path = "/root/sherpa-onnx/audios/meeting-zh.wav"
+    audio_path = "/root/sherpa-onnx/audios/girl-zh.wav"
+    # audio_path = "/root/sherpa-onnx/audios/meeting-zh.wav"
     
     if not os.path.exists(audio_path):
         print(f"❌ Audio file not found: {audio_path}")

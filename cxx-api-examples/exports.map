@@ -15,8 +15,6 @@
     is_auto_cleanup_enabled;
     set_intermediate_decode_samples;
     get_intermediate_decode_samples;
-    set_vad_process_threshold;
-    get_vad_process_threshold;
   local:
     *;
 };

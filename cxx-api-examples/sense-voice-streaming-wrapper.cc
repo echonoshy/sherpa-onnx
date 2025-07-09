@@ -42,7 +42,11 @@ private:
         std::mutex session_mutex;
         std::chrono::steady_clock::time_point last_activity;
         
-        SessionState() : offset(0), started(false), last_activity(std::chrono::steady_clock::now()) {}
+        // 添加VAD段位置跟踪
+        int32_t vad_processed_samples;  // 已经被VAD处理的样本数
+        
+        SessionState() : offset(0), started(false), last_activity(std::chrono::steady_clock::now()),
+                        vad_processed_samples(0) {}
     };
     
     std::unordered_map<std::string, std::shared_ptr<SessionState>> sessions_;
@@ -58,8 +62,6 @@ private:
     std::atomic<int> session_timeout_seconds_;
     std::unique_ptr<std::thread> cleanup_thread_;
     std::atomic<bool> stop_cleanup_thread_;
-    
-    int32_t min_vad_process_samples_;  // 最小VAD处理样本数阈值
     
     // 自动清理线程函数
     void AutoCleanupThread() {
@@ -103,8 +105,7 @@ public:
         : expected_sample_rate_(16000), window_size_(512), initialized_(false),
           intermediate_decode_samples_(3200),  // 0.2秒 * 16000 = 3200 samples
           auto_cleanup_enabled_(false), session_timeout_seconds_(300),
-          stop_cleanup_thread_(false),
-          min_vad_process_samples_(1024) {}  // 默认2个窗口
+          stop_cleanup_thread_(false) {}
     
     ~SenseVoiceStreamingWrapper() {
         // 停止自动清理线程
@@ -239,42 +240,48 @@ public:
         std::string result;
         bool has_final_result = false;  // 标记是否有最终结果
         
-        // 优化：只有当buffer中有足够数据时才进行VAD处理
-        // 避免频繁的小片段VAD计算
-        const int32_t min_vad_process_samples = window_size_ * 2;  // 至少2个窗口的数据
+        // 记录VAD处理前的buffer大小
+        int32_t buffer_size_before_vad = session->buffer.size();
         
-        // Process VAD on the buffer - 优化版本
-        if (session->buffer.size() - session->offset >= min_vad_process_samples || is_last) {
-            while (session->offset + window_size_ <= session->buffer.size()) {
-                session->vad->AcceptWaveform(session->buffer.data() + session->offset, window_size_);
-                if (!session->started && session->vad->IsDetected()) {
-                    session->started = true;
-                    session->started_time = std::chrono::steady_clock::now();
-                    session->last_intermediate_result.clear();
-                }
-                session->offset += window_size_;
+        while (session->offset + window_size_ <= session->buffer.size()) {
+            session->vad->AcceptWaveform(session->buffer.data() + session->offset, window_size_);
+            if (!session->started && session->vad->IsDetected()) {
+                session->started = true;
+                session->started_time = std::chrono::steady_clock::now();
+                session->last_intermediate_result.clear();
             }
+            session->offset += window_size_;
+            session->vad_processed_samples += window_size_;
         }
 
         // Trim buffer if no speech detected for a while
         if (!session->started) {
-            if (session->buffer.size() > 10 * window_size_) {
-                int keep_samples = 10 * window_size_;
-                session->offset -= session->buffer.size() - keep_samples;
+            // 大幅增加buffer大小，确保不丢失语音开始部分
+            if (session->buffer.size() > 60 * window_size_) {  // 约3.8秒
+                int keep_samples = 45 * window_size_;  // 约2.9秒
+                int32_t removed_samples = session->buffer.size() - keep_samples;
+                
+                session->offset -= removed_samples;
                 session->buffer = {session->buffer.end() - keep_samples, session->buffer.end()};
+                
+                // 调整vad_processed_samples
+                session->vad_processed_samples = std::max(0, 
+                    session->vad_processed_samples - removed_samples);
             }
         }
 
-        // Process completed VAD segments first (highest priority)
+        // Process completed VAD segments with correct position tracking
         while (!session->vad->IsEmpty()) {
             auto segment = session->vad->Front();
             session->vad->Pop();
 
-            // 当判断到端点的时候，清除中间结果，因为此时以端点的检测结果为准
             session->last_intermediate_result.clear();
             
             using namespace sherpa_onnx::cxx;
             OfflineStream stream = recognizer_->CreateStream();
+            
+            // 直接使用VAD段的数据，不添加额外的上下文
+            // VAD已经包含了必要的上下文信息
             stream.AcceptWaveform(expected_sample_rate_, segment.samples.data(),
                                 segment.samples.size());
             recognizer_->Decode(&stream);
@@ -293,6 +300,7 @@ public:
             // Reset state for next segment
             session->buffer.clear();
             session->offset = 0;
+            session->vad_processed_samples = 0;
             session->started = false;
             session->last_intermediate_result.clear();
         }
@@ -306,8 +314,21 @@ public:
             if (accumulated_samples >= intermediate_decode_samples_) {
                 using namespace sherpa_onnx::cxx;
                 OfflineStream stream = recognizer_->CreateStream();
-                // 使用完整的buffer进行解码，保持前文信息
-                stream.AcceptWaveform(expected_sample_rate_, session->buffer.data(), session->buffer.size());
+                
+                // 关键修复：中间解码也使用相同的前置上下文逻辑
+                // 计算前置上下文长度（300ms）
+                int32_t context_samples = expected_sample_rate_ * 0.3;
+                int32_t actual_start = std::max(0, static_cast<int32_t>(session->buffer.size()) - accumulated_samples - context_samples);
+                
+                // 创建包含上下文的音频数据用于中间解码
+                std::vector<float> audio_with_context;
+                if (actual_start < session->buffer.size()) {
+                    audio_with_context.insert(audio_with_context.end(),
+                                            session->buffer.begin() + actual_start,
+                                            session->buffer.end());
+                }
+                
+                stream.AcceptWaveform(expected_sample_rate_, audio_with_context.data(), audio_with_context.size());
                 recognizer_->Decode(&stream);
                 
                 OfflineRecognizerResult recognition_result = recognizer_->GetResult(&stream);
@@ -321,7 +342,7 @@ public:
                 
                 // 不要截断buffer，保持完整的上下文
                 // 只有当buffer过大时才进行适当的清理
-                const int32_t max_buffer_size = expected_sample_rate_ * 20; // 最大保持30秒
+                const int32_t max_buffer_size = expected_sample_rate_ * 12; // 最大保持12秒
                 if (session->buffer.size() > max_buffer_size) {
                     // 保留最后10秒的数据
                     int32_t keep_samples = expected_sample_rate_ * 10;
@@ -443,23 +464,9 @@ public:
         intermediate_decode_samples_ = samples;
     }
     
-    // // 设置中间解码的音频长度（秒）
-    // void SetIntermediateDecodeInterval(float seconds) {
-    //     intermediate_decode_samples_ = static_cast<int32_t>(seconds * expected_sample_rate_);
-    // }
-    
     // 获取当前设置的中间解码样本数
     int32_t GetIntermediateDecodeSamples() const {
         return intermediate_decode_samples_;
-    }
-
-    // 添加配置VAD处理阈值的方法
-    void SetVadProcessThreshold(int32_t min_samples) {
-        min_vad_process_samples_ = min_samples;
-    }
-    
-    int32_t GetVadProcessThreshold() const {
-        return min_vad_process_samples_;
     }
 };
 
@@ -570,13 +577,4 @@ extern "C" {
     EXPORT int32_t get_intermediate_decode_samples(SenseVoiceStreamingWrapper* wrapper) {
         return wrapper->GetIntermediateDecodeSamples();
     }
-    
-    EXPORT void set_vad_process_threshold(SenseVoiceStreamingWrapper* wrapper, 
-                                         int32_t min_samples) {
-        wrapper->SetVadProcessThreshold(min_samples);
-    }
-    
-    EXPORT int32_t get_vad_process_threshold(SenseVoiceStreamingWrapper* wrapper) {
-        return wrapper->GetVadProcessThreshold();
-    }
-} 
+}
