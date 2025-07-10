@@ -103,7 +103,7 @@ private:
 public:
     SenseVoiceStreamingWrapper() 
         : expected_sample_rate_(16000), window_size_(512), initialized_(false),
-          intermediate_decode_samples_(3200),  // 0.2秒 * 16000 = 3200 samples
+          intermediate_decode_samples_(16000),  // 1秒 * 16000 = 16000 samples
           auto_cleanup_enabled_(false), session_timeout_seconds_(300),
           stop_cleanup_thread_(false) {}
     
@@ -240,7 +240,7 @@ public:
         std::string result;
         bool has_final_result = false;  // 标记是否有最终结果
         
-        // VAD处理逻辑 - 参考参考文件的处理方式
+        // VAD处理逻辑
         for (; session->offset + window_size_ <= session->buffer.size(); session->offset += window_size_) {
             session->vad->AcceptWaveform(session->buffer.data() + session->offset, window_size_);
             if (!session->started && session->vad->IsDetected()) {
